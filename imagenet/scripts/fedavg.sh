@@ -1,0 +1,2 @@
+#!/bin/bash
+horovodrun -np 8 -H localhost:8 python ../train.py --dataroot /home/op1/ImageNetData/imagenet --log-dir ../logs/23_128_0.4/fedavg --checkpoint-format checkpoint-fedavg-{epoch}.pth.tar --init-model ../logs/23_128_0.4/init_model.pth --local_steps 128 --batch-size 32 --epochs 90 --base-lr 0.0125 --clipping-param 1e8 --momentum 0.9 --heterogeneity 0.4 --warmup-epochs 0 --optim-method SGDClipGrad
