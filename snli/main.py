@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.distributed as dist
 
 from arg_parser import arg_parser
-from data_loader import SNLIDataLoader, get_label_distribution, save_worker_idxs
+from data_loader import data_loader, get_label_distribution, save_worker_idxs
 from nli_net import NLINet
 from hinge_loss import MultiClassHingeLoss
 from train import train
@@ -61,56 +61,37 @@ def main():
 
     # Load data.
     print('Loading data...')
-    if args.algorithm in ["corrected_clip", "episode_scaffold", "episode_normal_1", "episode_double"]:
-        extras = [args.communication_interval * args.batchsize, args.batchsize]
-    elif args.algorithm in ["episode_practical", "episode_inverted", "delayed_clip", "test_correction", "episode_balanced"]:
-        extras = [args.batchsize]
-    elif args.algorithm in ["episode_final"]:
-        extras = [round(args.batchsize * args.epf_bs_scale)]
+    extra_bs = None
+    if args.algorithm == "episode_final":
+        extra_bs = round(args.batchsize * args.epf_bs_scale)
+    dataset = data_loader(
+        dataset_name=args.dataset,
+        root=args.dataroot,
+        batch_size=args.batchsize,
+        rank=args.rank,
+        world_size=args.world_size,
+        heterogeneity=args.heterogeneity,
+        extra_bs=None,
+        small=args.small,
+    )
+    train_loader = dataset[0]
+    if args.validation:
+        test_loader = dataset[1]
     else:
-        extras = []
-    train_loader = SNLIDataLoader(
-        batch_size=args.batchsize,
-        root=args.dataroot,
-        split="train",
-        small=args.small,
-        rank=args.rank,
-        world_size=args.world_size,
-        heterogeneity=args.heterogeneity,
-    )
-    test_loader = SNLIDataLoader(
-        batch_size=args.batchsize,
-        root=args.dataroot,
-        split="dev" if args.validation else "test",
-        small=args.small,
-        rank=args.rank,
-        world_size=args.world_size,
-        heterogeneity=args.heterogeneity,
-    )
-    extra_loaders = [
-        SNLIDataLoader(
-            batch_size=extra_bs,
-            root=args.dataroot,
-            split="train",
-            rank=args.rank,
-            small=args.small,
-            world_size=args.world_size,
-            heterogeneity=args.heterogeneity,
-        )
-        for extra_bs in extras
-    ]
+        test_loader = dataset[2]
+    extra_loader = dataset[3]
 
     # Construct model.
     net = NLINet(
-        n_words=train_loader.n_words,
-        word_embed_dim=train_loader.embed_dim,
+        n_words=train_loader.dataset.n_words,
+        word_embed_dim=train_loader.dataset.embed_dim,
         encoder_dim=args.encoder_dim,
         n_enc_layers=args.n_enc_layers,
         dpout_model=args.dpout_model,
         dpout_fc=args.dpout_fc,
         fc_dim=args.fc_dim,
         bsize=args.batchsize,
-        n_classes=train_loader.n_classes,
+        n_classes=train_loader.dataset.n_classes,
         pool_type=args.pool_type,
         linear_fc=args.linear_fc,
         bidirectional=(not args.unidirectional),
@@ -142,7 +123,7 @@ def main():
     else:
         criterion = nn.CrossEntropyLoss()
 
-    train_results, net = train(args, train_loader, test_loader, extra_loaders, net, criterion)
+    train_results, net = train(args, train_loader, test_loader, extra_loader, net, criterion)
 
     # Logging results.
     print('Writing the results.')

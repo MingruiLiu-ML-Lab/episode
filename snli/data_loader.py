@@ -10,6 +10,8 @@ from math import ceil
 
 import numpy as np
 import torch
+from torch.utils.data.sampler import SubsetRandomSampler
+from torch.utils.data import DataLoader
 
 
 GLOVE_URL = "http://nlp.stanford.edu/data/glove.840B.300d.zip"
@@ -20,45 +22,18 @@ WORDVEC_NAME = "wordvec.pkl"
 N_CLASSES = 3
 
 
-class SNLIDataLoader:
-    """ Loading SNLI data for PyTorch training. """
-    
-    def __init__(self, batch_size, root, split="train", small=False, rank=0, world_size=1, heterogeneity=0.0):
-        """ Init function for SNLIDataLoader. """
+class SNLIDataset(torch.utils.data.Dataset):
+
+    def __init__(self, root="", split="train"):
+        """ Initialize SNLI dataset. """
 
         assert split in ["train", "dev", "test"]
-        if world_size == 1 and heterogeneity > 0:
-            raise ValueError("Can't create heterogeneous dataset when world_size=1.")
-        assert 0 <= rank <= world_size - 1
-
-        self.batch_size = batch_size
         self.root = os.path.join(root, "snli_1.0")
         self.split = split
-        self.small = small
-        self.rank = rank
-        self.world_size = world_size
-        self.heterogeneity = heterogeneity
         self.embed_dim = GLOVE_DIM
         self.n_classes = N_CLASSES
 
-        # Load dataset.
-        self.load_data()
-        if self.world_size > 1:
-            self.partition()
-            print(f"Keeping only partition {self.rank} of size {self.dataset_size}.")
-        if self.small:
-            self.dataset_size = self.dataset_size // 100
-            self.s1_sentences = self.s1_sentences[:self.dataset_size]
-            self.s2_sentences = self.s2_sentences[:self.dataset_size]
-            self.targets = self.targets[:self.dataset_size]
-            print(f"Using 1% of data: {self.dataset_size} pairs for {self.split}.")
-
-        self._permutation = None
-        self._next_pos = None
-
-    def load_data(self):
-        """ Read data from files and store for batching. """
-
+        """ Read and store data from files. """
         self.labels = ["entailment", "neutral", "contradiction"]
         labels_to_idx = {label: i for i, label in enumerate(self.labels)}
 
@@ -146,135 +121,204 @@ class SNLIDataLoader:
                 ["</s>"]
             )
 
-    def reset(self):
-        """
-        Prepare for an iteration over the dataset: shuffle elements and reset counter
-        over seen elements.
-        """
-        self._permutation = np.random.permutation(self.dataset_size)
-        self._next_pos = 0
-        self._step = 0
+    def __len__(self):
+        return self.dataset_size
 
-    def next_batch(self):
-        """ Sample the next batch of elements from the dataset. """
+    def __getitem__(self, idx):
+        """ Return a single element of the dataset. """
 
-        if not self.has_next():
-            raise StopIteration
-
-        # Get idxs of current batch.
-        start = self._next_pos
-        end = min(self._next_pos + self.batch_size, self.dataset_size)
-        idxs = self._permutation[start:end]
-        bs = end - start
-        self._next_pos = end
-        self._step += 1
-
-        # Get sentences for batch and their lengths.
-        s1_batch = [self.s1_sentences[idx] for idx in idxs]
-        s1_lens = np.array([len(sent) for sent in s1_batch])
-        max_s1_len = np.max(s1_lens)
-        s2_batch = [self.s2_sentences[idx] for idx in idxs]
-        s2_lens = np.array([len(sent) for sent in s2_batch])
-        max_s2_len = np.max(s2_lens)
-        lens = (s1_lens, s2_lens)
-
-        # Encode sentences as glove vectors.
-        s1_embed = np.zeros((max_s1_len, bs, GLOVE_DIM))
-        s2_embed = np.zeros((max_s2_len, bs, GLOVE_DIM))
-        for i in range(len(idxs)):
-            for j in range(len(s1_batch[i])):
-                s1_embed[j, i] = self.word_vec[s1_batch[i][j]]
-            for j in range(len(s2_batch[i])):
-                s2_embed[j, i] = self.word_vec[s2_batch[i][j]]
-        embeds = (
-            torch.from_numpy(s1_embed).float(), torch.from_numpy(s2_embed).float()
-        )
+        # Encode sentences as sequence of glove vectors.
+        sent1 = self.s1_sentences[idx]
+        sent2 = self.s2_sentences[idx]
+        s1_embed = np.zeros((len(sent1), GLOVE_DIM))
+        s2_embed = np.zeros((len(sent2), GLOVE_DIM))
+        for j in range(len(sent1)):
+            s1_embed[j] = self.word_vec[sent1[j]]
+        for j in range(len(sent2)):
+            s2_embed[j] = self.word_vec[sent2[j]]
+        s1_embed = torch.from_numpy(s1_embed).float()
+        s2_embed = torch.from_numpy(s2_embed).float()
 
         # Convert targets to tensor.
-        targets = torch.from_numpy(self.targets[idxs]).long()
+        target = torch.tensor([self.targets[idx]]).long()
 
-        return embeds, lens, targets
-
-    def has_next(self):
-        """ Return True until all batches have been seen. """
-        return self._next_pos < self.dataset_size
-
-    def partition(self):
-        """
-        Split the dataset into local datasets for each client and keep only the local
-        dataset with index `self.rank`.
-        """
-
-        # Fix random seed so that data is shuffled the same across clients.
-        torch.manual_seed(1234)
-        np.random.seed(1234)
-        random.seed(1234)
-
-        # Collect indices of instances with each label.
-        train_label_idxs = [
-            (self.targets == i).nonzero()[0].tolist()
-            for i in range(self.n_classes)
-        ]
-        label_proportions = torch.tensor(
-            [float(len(train_label_idxs[i])) for i in range(self.n_classes)]
-        )
-        label_proportions /= torch.sum(label_proportions)
-        for l in range(self.n_classes):
-            random.shuffle(train_label_idxs[l])
-
-        # Divide samples from each label into iid pool and non-iid pool. Note that samples
-        # in iid pool are shuffled while samples in non-iid pool are sorted by label.
-        iid_pool = []
-        non_iid_pool = []
-        for i in range(self.n_classes):
-            iid_split = int((1.0 - self.heterogeneity) * len(train_label_idxs[i]))
-            iid_pool += train_label_idxs[i][:iid_split]
-            non_iid_pool += train_label_idxs[i][iid_split:]
-        random.shuffle(iid_pool)
-
-        # Allocate iid and non-iid samples to each worker.
-        iid_start = 0
-        non_iid_start = 0
-        partition_size = self.dataset_size // self.world_size
-        worker_idxs = [[] for _ in range(self.world_size)]
-        for j in range(self.world_size):
-            num_iid = int((1.0 - self.heterogeneity) * partition_size)
-            num_non_iid = partition_size - num_iid
-            worker_idxs[j] += iid_pool[iid_start: iid_start + num_iid]
-            worker_idxs[j] += non_iid_pool[non_iid_start: non_iid_start + num_non_iid]
-            iid_start += num_iid
-            non_iid_start += num_non_iid
-            random.shuffle(worker_idxs[j])
-
-        # Keep only dataset elements for current worker.
-        self.local_idxs = list(worker_idxs[self.rank])
-        self.s1_sentences = [self.s1_sentences[idx] for idx in self.local_idxs]
-        self.s2_sentences = [self.s2_sentences[idx] for idx in self.local_idxs]
-        self.targets = self.targets[self.local_idxs]
-        self.dataset_size = len(self.local_idxs)
-
-    def state(self):
-        """ State of the data loader. """
-        state = {
-            "permutation": self._permutation.copy(),
-            "next_pos": self._next_pos,
-            "step": self._step,
-        }
-        return state
-
-    def load_state(self, state):
-        """ Load a state for the data loader. """
-        self._permutation = state["permutation"]
-        self._next_pos = state["next_pos"]
-        self._step = state["step"]
+        return s1_embed, s2_embed, target
 
     @property
     def n_words(self):
         return len(self.word_vec)
 
-    @property
-    def num_batches(self):
-        return ceil(self.dataset_size / self.batch_size)
+
+def collate_pad(data_points):
+    """ Pad data points with zeros to fit length of longest data point in batch. """
+
+    s1_embeds = [x[0] for x in data_points]
+    s2_embeds = [x[1] for x in data_points]
+    targets = [x[2] for x in data_points]
+
+    # Get sentences for batch and their lengths.
+    s1_lens = np.array([sent.shape[0] for sent in s1_embeds])
+    max_s1_len = np.max(s1_lens)
+    s2_lens = np.array([sent.shape[0] for sent in s2_embeds])
+    max_s2_len = np.max(s2_lens)
+    lens = (s1_lens, s2_lens)
+
+    # Encode sentences as glove vectors.
+    bs = len(data_points)
+    s1_embed = np.zeros((max_s1_len, bs, GLOVE_DIM))
+    s2_embed = np.zeros((max_s2_len, bs, GLOVE_DIM))
+    for i in range(bs):
+        e1 = s1_embeds[i]
+        e2 = s2_embeds[i]
+        s1_embed[: len(e1), i] = e1.clone()
+        s2_embed[: len(e2), i] = e2.clone()
+    embeds = (
+        torch.from_numpy(s1_embed).float(), torch.from_numpy(s2_embed).float()
+    )
+
+    # Convert targets to tensor.
+    targets = torch.cat(targets)
+
+    return embeds, lens, targets
+
+
+def data_loader(
+    dataset_name,
+    root,
+    batch_size,
+    rank=0,
+    world_size=1,
+    heterogeneity=0.0,
+    extra_bs=None,
+    num_workers=1,
+    small=False,
+):
+    """ Construct data loaders for training, validation, and test data. """
+
+    if heterogeneity < 0:
+        raise ValueError("Data heterogeneity must be positive.")
+    if world_size == 1 and heterogeneity > 0:
+        raise ValueError("Cannot create a heterogeneous dataset when world_size == 1.")
+
+    train_set = SNLIDataset(root=root, split="train")
+    val_set = SNLIDataset(root=root, split="dev")
+    test_set = SNLIDataset(root=root, split="test")
+
+    # Partition the training data into multiple clients. Data partitioning to create
+    # heterogeneity is performed according to the specifications in
+    # https://arxiv.org/abs/1910.06378.
+    if world_size > 1:
+        torch.manual_seed(1234)
+        np.random.seed(1234)
+        random.seed(1234)
+
+    # Collect indices of instances with each label.
+    train_label_idxs = [
+        (train_set.targets == i).nonzero()[0].tolist()
+        for i in range(train_set.n_classes)
+    ]
+    for l in range(train_set.n_classes):
+        random.shuffle(train_label_idxs[l])
+
+    # Divide samples from each label into iid pool and non-iid pool. Note that samples
+    # in iid pool are shuffled while samples in non-iid pool are sorted by label.
+    iid_pool = []
+    non_iid_pool = []
+    for i in range(train_set.n_classes):
+        iid_split = int((1.0 - heterogeneity) * len(train_label_idxs[i]))
+        iid_pool += train_label_idxs[i][:iid_split]
+        non_iid_pool += train_label_idxs[i][iid_split:]
+    random.shuffle(iid_pool)
+
+    # Allocate iid and non-iid samples to each worker.
+    worker_train_idxs = [[] for _ in range(world_size)]
+    num_iid = len(iid_pool) // world_size
+    num_non_iid = len(non_iid_pool) // world_size
+    partition_size = num_iid + num_non_iid
+    for j in range(world_size):
+        worker_train_idxs[j] += iid_pool[num_iid * j: num_iid * (j+1)]
+        worker_train_idxs[j] += non_iid_pool[num_non_iid * j: num_non_iid * (j+1)]
+        random.shuffle(worker_train_idxs[j])
+
+    # Get indices of local validation and test dataset. Note that the validation and
+    # test set are not split into `total_clients` partitions, just `world_size`
+    # partitions, since evaluation does not need to happen separate for each client.
+    # TODO: Do we really need to enforce that each partition of the test set has the
+    # same size? We are just throwing away some test examples here and it may be
+    # unnecessary.
+    val_partition = len(val_set) // world_size
+    test_partition = len(test_set) // world_size
+    val_idxs = list(range(val_partition * world_size))
+    test_idxs = list(range(test_partition * world_size))
+    random.shuffle(val_idxs)
+    random.shuffle(test_idxs)
+    local_val_idxs = val_idxs[rank * val_partition: (rank+1) * val_partition]
+    local_test_idxs = test_idxs[rank * test_partition: (rank+1) * test_partition]
+
+    # Use miniature dataset, if necessary.
+    if small:
+        for r in range(world_size):
+            worker_train_idxs[r] = worker_train_idxs[r][:round(len(worker_train_idxs[r]) / 100)]
+        local_val_idxs = local_val_idxs[:round(len(local_val_idxs) / 100)]
+        local_test_idxs = local_test_idxs[:round(len(local_test_idxs) / 100)]
+
+    # Check that each worker training dataset is disjoint and that training set is
+    # disjoint from validation set. This is slow, so only uncomment this for testing.
+    """
+    print("Testing partitioned dataset...")
+    for i in range(world_size):
+        current_idxs = worker_train_idxs[i]
+        other_idxs = []
+        for j in range(total_clients):
+            if j == i:
+                continue
+            other_idxs += worker_train_idxs[j]
+        for idx in current_idxs:
+            assert idx not in other_idxs
+
+    print("Testing passed!")
+    """
+
+    # Construct loaders for train, val, test, and extra sets.
+    train_loader = DataLoader(
+        train_set,
+        batch_size=batch_size,
+        sampler=SubsetRandomSampler(worker_train_idxs[rank]),
+        num_workers=num_workers,
+        collate_fn=collate_pad,
+        pin_memory=True,
+    )
+
+    val_loader = DataLoader(
+        val_set,
+        batch_size=batch_size,
+        sampler=SubsetRandomSampler(local_val_idxs),
+        num_workers=num_workers,
+        collate_fn=collate_pad,
+        pin_memory=True,
+    )
+
+    test_loader = DataLoader(
+        test_set,
+        batch_size=batch_size,
+        sampler=SubsetRandomSampler(local_test_idxs),
+        num_workers=num_workers,
+        collate_fn=collate_pad,
+        pin_memory=True,
+    )
+
+    extra_loader = None
+    if extra_bs is not None:
+        extra_loader = DataLoader(
+            train_set,
+            sampler=SubsetRandomSampler(worker_train_idxs[rank]),
+            batch_size=extra_bs,
+            num_workers=num_workers,
+            collate_fn=collate_pad,
+            pin_memory=True,
+        )
+
+    return train_loader, val_loader, test_loader, extra_loader
 
 
 def get_label_distribution(loader):

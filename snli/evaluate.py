@@ -21,9 +21,7 @@ def evaluate(test_loader, net, criterion):
     loss = 0.0
     total = 0
     with torch.no_grad():
-        test_loader.reset()
-        while test_loader.has_next():
-            data = test_loader.next_batch()
+        for data in test_loader:
             (s1_embed, s2_embed), (s1_lens, s2_lens), targets = data
             s1_embed, s2_embed = s1_embed.cuda(), s2_embed.cuda()
             targets = targets.cuda()

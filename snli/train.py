@@ -45,14 +45,14 @@ def comp_grad_l2_norm(model) -> float:
     grad_l2_norm = torch.sqrt(grad_l2_norm_sq).item()
     return grad_l2_norm
 
-def train(args, train_loader, test_loader, extra_loaders, net, criterion):
+def train(args, train_loader, test_loader, extra_loader, net, criterion):
     """
     Args:
         args: parsed command line arguments.
         train_loader: an iterator over the training set.
         test_loader: an iterator over the test set.
-        extra_loaders: A list of iterators over the training set, which enables gradient
-            samples independent from those drawn for training. Only used for algorithm
+        extra_loader: An over the training set, which enables gradient samples
+            independent from those drawn for training. Only used for algorithm
             'corrected_clip'.
         net: the neural network model employed.
         criterion: the loss function.
@@ -79,10 +79,8 @@ def train(args, train_loader, test_loader, extra_loaders, net, criterion):
     local_clip_l2_norm = None
     global_clip_l2_norm = None
 
-    for loader in extra_loaders:
-        loader.reset()
     eval_steps = [
-        int((i + 1) * (train_loader.num_batches / args.evals_per_epoch)) - 1
+        int((i + 1) * (len(train_loader) / args.evals_per_epoch)) - 1
         for i in range(args.evals_per_epoch)
     ]
 
@@ -103,10 +101,8 @@ def train(args, train_loader, test_loader, extra_loaders, net, criterion):
     for epoch_idx in range(1, args.train_epochs + 1):
         net.train()
 
-        train_loader.reset()
         t = 0
-        while train_loader.has_next():
-            data = train_loader.next_batch()
+        for data in train_loader:
 
             # print(f'Rank {args.rank} -- {t_total}')
             if 0 == t_total % args.communication_interval:
@@ -308,11 +304,15 @@ def train(args, train_loader, test_loader, extra_loaders, net, criterion):
                 # We save and restore the state of the training data loader so that we
                 # can iterate over the training set without interrupting the current
                 # epoch.
+                train_loss = 0
+                train_accuracy = 0
+                """
                 train_state = train_loader.state()
                 train_loss, train_accuracy = evaluate(train_loader, net_clone, criterion)
+                train_loader.load_state(train_state)
+                """
                 all_train_losses.append(train_loss)
                 all_train_accuracies.append(train_accuracy)
-                train_loader.load_state(train_state)
 
                 test_loss, test_accuracy = evaluate(test_loader, net_clone, criterion)
                 all_test_losses.append(test_loss)
