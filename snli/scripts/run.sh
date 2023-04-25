@@ -44,10 +44,10 @@ else
 fi
 
 if [ "$DATASET" == "SNLI" ]; then
-    epochs=10
+    epochs=1
     milestones="15 20"
     decay=0.5
-    evals=1
+    evals=5
     epf_bs_scale=1
 else
     echo "Unrecognized dataset: $DATASET."
@@ -74,7 +74,7 @@ while [ $i -lt $WORKERS_PER_NODE ]; do
         --communication-interval $I \
         --train-epochs $epochs \
         --evals-per-epoch $evals \
-        --batchsize 128 \
+        --batchsize 64 \
         --rnn \
         --n_enc_layers 1 \
         --encoder_dim 2048 \

@@ -208,8 +208,6 @@ def data_loader(
     # heterogeneity is performed according to the specifications in
     # https://arxiv.org/abs/1910.06378.
     if world_size > 1:
-        torch.manual_seed(1234)
-        np.random.seed(1234)
         random.seed(1234)
 
     # Collect indices of instances with each label.
@@ -225,7 +223,7 @@ def data_loader(
     iid_pool = []
     non_iid_pool = []
     for i in range(train_set.n_classes):
-        iid_split = int((1.0 - heterogeneity) * len(train_label_idxs[i]))
+        iid_split = round((1.0 - heterogeneity) * len(train_label_idxs[i]))
         iid_pool += train_label_idxs[i][:iid_split]
         non_iid_pool += train_label_idxs[i][iid_split:]
     random.shuffle(iid_pool)
